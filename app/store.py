@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS reports (
     fingerprint TEXT PRIMARY KEY,
     report_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS inputs (
+    fingerprint TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
 """
 
 
@@ -174,6 +178,37 @@ class TaskStore:
                 (fingerprint,),
             ).fetchone()
         return _report_from_json(row[0]) if row else None
+
+    def save_input(self, fingerprint: str, files: list[tuple[str, bytes]]) -> None:
+        payload = json.dumps(
+            [[path, raw.decode("latin-1")] for path, raw in files],
+            ensure_ascii=False, sort_keys=True,
+        )
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO inputs (fingerprint, payload_json) VALUES (?, ?)"
+                " ON CONFLICT(fingerprint) DO NOTHING",
+                (fingerprint, payload),
+            )
+
+    def load_input(self, fingerprint: str) -> list[tuple[str, bytes]] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM inputs WHERE fingerprint = ?",
+                (fingerprint,),
+            ).fetchone()
+        if not row:
+            return None
+        return [(path, text.encode("latin-1")) for path, text in json.loads(row[0])]
+
+    def fingerprint_index(self) -> dict[str, str]:
+        """返回 {指纹: 最早任务id}，用于启动时重建去重索引。"""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT fingerprint, task_id FROM tasks"
+                " GROUP BY fingerprint ORDER BY created_at ASC"
+            ).fetchall()
+        return dict(rows)
 
     def recover_unfinished(self) -> list[TaskRecord]:
         """重启后恢复未完成任务（QUEUED/RUNNING）。"""
