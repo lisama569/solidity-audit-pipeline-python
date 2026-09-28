@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 
-from app.models import AuditReport, Finding, Severity
+from app.models import AuditReport, Finding, IssueRef, Severity
 from app.rules import RawHit, run_rules
 
 
@@ -35,6 +35,19 @@ def merge_hits(hits: list[RawHit], fingerprint_str: str = "") -> AuditReport:
         rule_ids = tuple(sorted({h.rule_id for h in group}))
         severity = Severity(max(h.severity for h in group))
         message = "；".join(h.message for h in sorted(group, key=lambda h: h.rule_id))
+        # 同一 (规则, 问题身份) 可能因多处调用产生多条命中，取最高严重度后去重
+        issue_map: dict[tuple[str, str], Severity] = {}
+        for h in group:
+            if not h.issue_key:
+                continue
+            k = (h.rule_id, h.issue_key)
+            prev = issue_map.get(k)
+            if prev is None or int(h.severity) > int(prev):
+                issue_map[k] = h.severity
+        issues = tuple(
+            IssueRef(rule_id=r, issue_key=k, severity=s)
+            for (r, k), s in sorted(issue_map.items())
+        )
         findings.append(
             Finding(
                 finding_id=_finding_id(file, line, contract, function, rule_ids),
@@ -45,6 +58,7 @@ def merge_hits(hits: list[RawHit], fingerprint_str: str = "") -> AuditReport:
                 contract=contract,
                 function=function,
                 message=message,
+                issues=issues,
             )
         )
 

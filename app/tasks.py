@@ -165,6 +165,10 @@ class TaskManager:
 
     # ---------- 公共 API ----------
 
+    @property
+    def store(self) -> TaskStore:
+        return self._store
+
     def submit(self, files: list[tuple[str, bytes]]) -> TaskRecord:
         """提交审计任务；相同内容（任意并发时序）返回同一任务，不重复计算。
 

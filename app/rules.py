@@ -27,6 +27,7 @@ class RawHit:
     contract: str
     function: str
     message: str
+    issue_key: str = ""  # 问题稳定身份（与行号/命名/注释无关，由结构计算）
 
 
 RULE_REENTRANCY = "REENTRANCY"
@@ -47,6 +48,124 @@ _LOCK_NAME_RE = re.compile(r"lock|guard|mutex|entered|reentr", re.IGNORECASE)
 _EXT_CALL_RE = re.compile(
     r"\.\s*(call|delegatecall|callcode|send|transfer)\s*[({]"
 )
+
+# 归一化时保留的 Solidity 关键字/内置名（其余标识符视为用户命名，统一屏蔽），
+# 这样纯重命名不会改变问题身份，而结构性改动（是否 require/checked 等）会。
+_RESERVED_WORDS = frozenset(
+    {
+        "require", "assert", "revert", "if", "else", "for", "while", "do",
+        "return", "returns", "true", "false", "new", "delete", "public",
+        "private", "internal", "external", "view", "pure", "payable",
+        "constant", "immutable", "memory", "storage", "calldata", "this",
+        "super", "msg", "tx", "block", "value", "sender", "data", "ok",
+        "bool", "uint", "int", "address", "bytes", "string",
+    }
+)
+_TOKEN_RE = re.compile(r"[A-Za-z_]\w*|\d+|0x[0-9a-fA-F]+|\".*?\"|'.*?'|\S")
+
+
+def _mask_identifiers(text: str) -> str:
+    """把用户标识符/数值/字符串字面量归一为 #，保留关键字与运算符结构。"""
+    def repl(m: re.Match[str]) -> str:
+        tok = m.group(0)
+        if tok[0].isalpha() or tok[0] == "_":
+            return tok if tok in _RESERVED_WORDS else "#"
+        return "#"  # 数值与字符串字面量
+
+    return _TOKEN_RE.sub(repl, text)
+
+
+def _normalize_code(text: str) -> str:
+    """空白折叠 + 标识符屏蔽，得到只反映结构的规范串。"""
+    masked = _mask_identifiers(text)
+    return re.sub(r"\s+", " ", masked).strip()
+
+
+def _enclosing_statement(fn: "_Function", cm: re.Match[str]) -> str:
+    """提取外部调用所在语句的源码片段（用于稳定身份）。"""
+    stmt_start = max(
+        fn.body.rfind(";", 0, cm.start()),
+        fn.body.rfind("{", 0, cm.start()),
+        fn.body.rfind("}", 0, cm.start()),
+    ) + 1
+    stmt_end = fn.body.find(";", cm.end())
+    return fn.body[stmt_start : stmt_end if stmt_end != -1 else len(fn.body)]
+
+
+def _norm_statement(fn: "_Function", cm: re.Match[str]) -> str:
+    stmt = _enclosing_statement(fn, cm)
+    # 身份层面把外部调用抽象为统一标记：操作码严重度差异交给分类器
+    # 判为 SEVERITY_CHANGED，调用附带的 {value/gas} 与实参属于噪声。
+    # 不同性质的问题（delegatecall vs 普通 call）由函数上下文中的其余
+    # 结构与分类结果共同区分。
+    stmt = re.sub(r"\{[^{}]*\}", "", stmt)
+    stmt = re.sub(
+        r"\.\s*(call|delegatecall|callcode|send|transfer)\s*\([^()]*\)",
+        ".<CALL>",
+        stmt,
+    )
+    stmt = re.sub(
+        r"\.\s*(call|delegatecall|callcode|send|transfer)\b", ".<CALL>", stmt
+    )
+    return _normalize_code(stmt)
+
+
+def _norm_write_snippets(fn: "_Function", state_vars: list[str],
+                        after: int) -> list[str]:
+    """外部调用之后的状态写语句规范串（直接写，用于重入身份）。"""
+    out: list[str] = []
+    for var in state_vars:
+        for m in re.finditer(
+            r"\b" + re.escape(var) + r"\b(?:\s*\[[^\]]*\])?"
+            r"\s*(?:[-+*/|&^%]?=(?![=>])|\+\+|--)",
+            fn.body,
+        ):
+            if m.start() <= after:
+                continue
+            stmt_end = fn.body.find(";", m.end())
+            out.append(
+                _normalize_code(
+                    fn.body[m.start() : stmt_end if stmt_end != -1 else len(fn.body)]
+                )
+            )
+        for m in re.finditer(r"\bdelete\s+" + re.escape(var) + r"\b", fn.body):
+            if m.start() <= after:
+                continue
+            stmt_end = fn.body.find(";", m.end())
+            out.append(
+                _normalize_code(
+                    fn.body[m.start() : stmt_end if stmt_end != -1 else len(fn.body)]
+                )
+            )
+    return sorted(set(out))
+
+
+def _function_context(fn: "_Function", cm: re.Match[str]) -> str:
+    """函数身份：归一化函数头 + 挖空当前调用点语句后的函数体。
+
+    调用点语句本身被挖空，因此 send->call 这类调用方式升级不会改变函数身份；
+    而调用点之外的结构差异（不同函数）仍然可区分。
+    """
+    stmt_start = max(
+        fn.body.rfind(";", 0, cm.start()),
+        fn.body.rfind("{", 0, cm.start()),
+        fn.body.rfind("}", 0, cm.start()),
+    ) + 1
+    stmt_end = fn.body.find(";", cm.end())
+    end = stmt_end + 1 if stmt_end != -1 else len(fn.body)
+    blanked = fn.body[:stmt_start] + " " + fn.body[end:]
+    return _normalize_code(fn.header + " " + blanked)
+
+
+def _dangerous_key(file: str, context: str, norm_stmt: str) -> str:
+    return f"D|{file}|{context}|{norm_stmt}"
+
+
+def _reentrancy_key(file: str, context: str, norm_stmt: str, writes: list[str],
+                    cross: list[str]) -> str:
+    return (
+        f"R|{file}|{context}|{norm_stmt}|w={','.join(writes)}|c={','.join(cross)}"
+    )
 
 
 @dataclass
@@ -225,12 +344,14 @@ def _analyze_contract(
         calls = list(_EXT_CALL_RE.finditer(fn.body))
         if not calls:
             continue
-        writes = _state_writes(fn, contract.state_vars)
         protected = _is_protected(contract, fn)
 
         for cm in calls:
             op = cm.group(1)
             call_line = _line_of(text, fn.body_offset + cm.start())
+            norm_stmt = _norm_statement(fn, cm)
+            context = _function_context(fn, cm)
+            d_key = _dangerous_key(file, context, norm_stmt)
 
             # --- 规则：危险外部调用 ---
             if op in ("delegatecall", "callcode"):
@@ -243,14 +364,11 @@ def _analyze_contract(
                         contract=contract.name,
                         function=fn.name,
                         message=f"危险的 {op} 外部调用，可执行任意代码",
+                        issue_key=d_key,
                     )
                 )
             elif op == "call":
-                stmt_start = max(fn.body.rfind(";", 0, cm.start()),
-                                 fn.body.rfind("{", 0, cm.start()),
-                                 fn.body.rfind("}", 0, cm.start())) + 1
-                stmt_end = fn.body.find(";", cm.end())
-                stmt = fn.body[stmt_start : stmt_end if stmt_end != -1 else len(fn.body)]
+                stmt = _enclosing_statement(fn, cm)
                 checked = "require" in stmt or re.search(r"\bbool\b", stmt)
                 if not checked:
                     hits.append(
@@ -262,14 +380,11 @@ def _analyze_contract(
                             contract=contract.name,
                             function=fn.name,
                             message="低层 call 外部调用且未检查返回值",
+                            issue_key=d_key,
                         )
                     )
             elif op == "send":
-                stmt_start = max(fn.body.rfind(";", 0, cm.start()),
-                                 fn.body.rfind("{", 0, cm.start()),
-                                 fn.body.rfind("}", 0, cm.start())) + 1
-                stmt_end = fn.body.find(";", cm.end())
-                stmt = fn.body[stmt_start : stmt_end if stmt_end != -1 else len(fn.body)]
+                stmt = _enclosing_statement(fn, cm)
                 if "require" not in stmt and not re.search(r"\bbool\b", stmt):
                     hits.append(
                         RawHit(
@@ -280,20 +395,25 @@ def _analyze_contract(
                             contract=contract.name,
                             function=fn.name,
                             message="send 返回值未检查",
+                            issue_key=d_key,
                         )
                     )
 
             # --- 规则：重入（call 之后仍存在状态写） ---
             if protected:
                 continue
-            later_write = any(w > cm.start() for w in writes)
-            cross_fn = False
+            write_snips = _norm_write_snippets(fn, contract.state_vars, cm.start())
+            later_write = bool(write_snips)
+            cross_bodies: list[str] = []
             if not later_write:
                 tail = fn.body[cm.end() :]
                 for callee in re.findall(r"\b([A-Za-z_]\w*)\s*\(", tail):
                     if callee in fn_by_name and callee != fn.name and writers.get(callee):
-                        cross_fn = True
-                        break
+                        cross_bodies.append(
+                            _normalize_code(fn_by_name[callee].body)
+                        )
+            cross_bodies = sorted(set(cross_bodies))
+            cross_fn = bool(cross_bodies)
             if later_write or cross_fn:
                 sev = (
                     Severity.HIGH
@@ -312,6 +432,9 @@ def _analyze_contract(
                         message=(
                             f"外部 {op} 调用之后仍存在状态写（{kind}重入风险），"
                             "且未受重入锁保护"
+                        ),
+                        issue_key=_reentrancy_key(
+                            file, context, norm_stmt, write_snips, cross_bodies
                         ),
                     )
                 )
