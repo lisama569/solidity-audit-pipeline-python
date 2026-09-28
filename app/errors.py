@@ -11,3 +11,12 @@ class IngestError(Exception):
         super().__init__(f"{code.value}: {detail}")
         self.code = code
         self.detail = detail
+
+
+class BaselineError(Exception):
+    """版本对比时基线不可用；原因彼此可区分，不会降级为单版本审计。"""
+
+    def __init__(self, code: ErrorCode, detail: str) -> None:
+        super().__init__(f"{code.value}: {detail}")
+        self.code = code
+        self.detail = detail

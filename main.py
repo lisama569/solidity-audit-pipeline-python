@@ -1,10 +1,11 @@
 """Solidity 静态审计流水线服务入口。
 
 API：
-- POST   /audits                   提交审计（multipart 文件列表），重复内容自动去重
-- GET    /audits/{task_id}         查询任务状态与结论
-- POST   /audits/{task_id}/cancel  取消排队/运行中的任务
-- POST   /audits/{task_id}/retry   重试失败/超时/取消的任务
+- POST   /audits                          提交审计（multipart 文件列表），重复内容自动去重
+- GET    /audits/{task_id}                查询任务状态与结论
+- POST   /audits/{task_id}/cancel         取消排队/运行中的任务
+- POST   /audits/{task_id}/retry          重试失败/超时/取消的任务
+- POST   /audits/{task_id}/compare        以 {task_id} 为基线，提交新版本做版本对比
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ import os
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 
-from app.errors import IngestError
+from app.errors import BaselineError, IngestError
 from app.store import TaskStore
 from app.tasks import TaskManager, record_to_dict
 
@@ -84,4 +85,32 @@ def retry_audit(task_id: str) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if record is None:
         raise HTTPException(status_code=404, detail="任务不存在")
+    return record_to_dict(record)
+
+
+@app.post("/audits/{task_id}/compare", status_code=202)
+async def compare_audit(
+    task_id: str,
+    files: list[UploadFile] | None = File(default=None),
+) -> dict:
+    """以已完成的历史审计 {task_id} 为基线，提交新版本做版本对比。
+
+    基线不存在/未完成/与当前提交对不上时返回 400，error_code 分别为
+    BASELINE_NOT_FOUND / BASELINE_NOT_READY / BASELINE_UNRELATED，
+    绝不降级为普通单版本审计。
+    """
+    payload = [(f.filename or "unnamed.sol", await f.read()) for f in (files or [])]
+    manager = get_manager()
+    try:
+        record = manager.submit_diff(payload, task_id)
+    except BaselineError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": exc.code.value, "detail": exc.detail},
+        ) from exc
+    except IngestError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error_code": exc.code.value, "detail": exc.detail},
+        ) from exc
     return record_to_dict(record)

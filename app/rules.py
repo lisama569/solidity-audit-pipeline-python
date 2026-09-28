@@ -7,9 +7,14 @@
 4. 在函数体内定位外部调用与状态写，按规则产出 RawHit。
 
 同一处问题被多条规则命中时，由 engine 层按 (file, line, function) 合并。
+
+另提供 compute_site_signatures：为每个外部调用站点生成**跨版本稳定签名**，
+签名只依赖规范化后的函数体语义与调用点在函数内的序号，与行号、函数排列顺序、
+整体位移、标识符命名和注释无关，供版本对比做问题匹配。
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 
@@ -327,3 +332,138 @@ def run_rules(sources: dict[str, str], ordered_paths: list[str]) -> list[RawHit]
             hits.extend(_analyze_contract(path, text, contract))
     hits.sort(key=lambda h: (h.file, h.line, h.rule_id, h.function))
     return hits
+
+
+# ---------------------------------------------------------------------------
+# 跨版本稳定站点签名
+# ---------------------------------------------------------------------------
+
+# Solidity 关键字 / 语言内建标识符 / 常见全局成员；其余标识符视为用户自定义名
+_BUILTIN_IDS = frozenset(
+    """
+    pragma solidity contract library interface function modifier constructor
+    fallback receive return returns public private internal external pure view
+    payable constant immutable virtual override memory storage calldata new delete
+    if else for while do break continue true false this super mapping struct enum
+    event emit import using try catch throw type tuple unchecked assembly revert
+    require assert anonymous indexed abstract address bool string byte bytes var
+    uint int uint8 uint16 uint32 uint64 uint128 uint256 int8 int16 int32 int64
+    int128 int256 bytes1 bytes4 bytes8 bytes16 bytes32 fixed ufixed wei gwei szabo
+    finney ether seconds minutes hours days weeks years
+    msg sender value data sig gas now block timestamp number coinbase difficulty
+    gaslimit chainid basefee blobhash blobbasefee prevrandao tx origin gasprice
+    gasleft blockhash selfdestruct suicide addmod mulmod keccak256 sha256
+    ripemd160 ecrecover abi encode decode encodePacked encodeWithSignature
+    encodeWithSelector length push pop balance code codehash codesize call send
+    transfer delegatecall staticcall callcode selectorsupportsinterface
+    """.split()
+)
+_BUILTIN_TYPE_RE = re.compile(r"^(u?int\d*|bytes\d*|u?fixed\d*x\d+|addresspayable)$")
+
+_TOKEN_RE = re.compile(
+    r"""
+      (?P<hex>0x[0-9a-fA-F]+)
+    | (?P<number>\d+(?:\.\d+)?(?:e\d+)?)
+    | (?P<string>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')
+    | (?P<ident>[A-Za-z_$][A-Za-z0-9_$]*)
+    | (?P<space>\s+)
+    | (?P<other>.)
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+
+def _canonicalize(code: str, slots: dict[str, str] | None = None) -> tuple[str, dict[str, str]]:
+    """把代码规范化：用户自定义标识符按出现顺序槽位化（$0,$1,...），
+    关键字/内建名/成员访问/类型名保持原样；字面量归一；空白折叠。
+
+    纯重命名、注释差异（调用前已去注释）与空白差异不会改变规范化结果。
+    """
+    if slots is None:
+        slots = {}
+    out: list[str] = []
+    last_sig = ""
+    for m in _TOKEN_RE.finditer(code):
+        kind = m.lastgroup
+        tok = m.group()
+        if kind == "space":
+            if out and out[-1] != " ":
+                out.append(" ")
+        elif kind in ("hex", "number"):
+            out.append("N")
+        elif kind == "string":
+            out.append("S")
+        elif kind == "ident":
+            word = tok
+            if last_sig == ".":
+                # 成员名（如 .call/.transfer/状态变量成员）属于语义，保持原样
+                out.append(word)
+            elif word in _BUILTIN_IDS or _BUILTIN_TYPE_RE.match(word.lower()):
+                out.append(word)
+            else:
+                if word not in slots:
+                    slots[word] = f"${len(slots)}"
+                out.append(slots[word])
+        else:
+            out.append(tok)
+        if kind != "space":
+            last_sig = tok
+    text = "".join(out).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text, slots
+
+
+def _state_skeleton_canonical(contract: _Contract) -> str:
+    """合约骨架签名：状态变量声明序列（去函数体后按声明顺序，标识符槽位化）。
+
+    用于区分同一文件内的不同合约；合约改名不影响结果。
+    """
+    funcs, skeleton = _parse_functions(
+        contract.body, contract.body_offset
+    )
+    slots: dict[str, str] = {}
+    parts: list[str] = []
+    for m in _STATE_VAR_RE.finditer(skeleton):
+        canon, slots = _canonicalize(m.group(0).strip(), slots)
+        parts.append(canon)
+    return "|".join(parts)
+
+
+def _site_signature(
+    file: str,
+    contract: _Contract,
+    fn: _Function,
+    call_ordinal: int,
+) -> str:
+    body_canon, _ = _canonicalize(fn.body)
+    skeleton_canon = _state_skeleton_canonical(contract)
+    h = hashlib.sha256()
+    for part in (file, skeleton_canon, body_canon, str(call_ordinal)):
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    return "S-" + h.hexdigest()[:14]
+
+
+def compute_site_signatures(
+    sources: dict[str, str], ordered_paths: list[str]
+) -> dict[tuple[str, str, str, int], str]:
+    """为每个外部调用站点计算跨版本稳定签名。
+
+    返回 {(file, contract, function, line): 站点基础签名}。
+    行号只作为字典键使用；签名内容本身不含行号，整体挪动/重排不受影响。
+    """
+    mapping: dict[tuple[str, str, str, int], str] = {}
+    for path in ordered_paths:
+        text = _strip_comments(sources[path])
+        for contract in _parse_contracts(text):
+            for fn in contract.functions:
+                if fn.kind != "function":
+                    continue
+                for ordinal, cm in enumerate(
+                    _EXT_CALL_RE.finditer(fn.body), start=1
+                ):
+                    line = _line_of(text, fn.body_offset + cm.start())
+                    mapping[(path, contract.name, fn.name, line)] = (
+                        _site_signature(path, contract, fn, ordinal)
+                    )
+    return mapping
