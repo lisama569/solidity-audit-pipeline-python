@@ -127,3 +127,44 @@ def test_hits_deterministic_across_runs():
     a = _hits(REENTRANCY_CROSS_FN)
     b = _hits(REENTRANCY_CROSS_FN)
     assert a == b
+
+
+# ---------------------------------------------------------------------------
+# 站点签名的外部调用形态规范化（严重程度变化匹配的基础）
+# ---------------------------------------------------------------------------
+
+def test_value_transfer_forms_neutralize_identically():
+    # send(x) / transfer(x) / call{value:x}(...)（含带 gas 选项、选项顺序变化）
+    # 归一后形状一致（同金额表达式），支撑严重程度变化跨操作符匹配
+    from app.rules import _canonicalize_for_site
+
+    same_semantic = [
+        "to.send(amount);",
+        "to.transfer(amount);",
+        "to.call{value: amount}("");",
+        "to.call{gas: 5000, value: amount}("");",
+    ]
+    canons = {_canonicalize_for_site(src)[0] for src in same_semantic}
+    assert len(canons) == 1, canons
+    canon = canons.pop()
+    assert "valuetransfer" in canon
+    print(f"[rules] 转账形态统一 -> {canon}")
+
+
+def test_non_value_low_level_calls_keep_distinct_shape():
+    # 不带 value 的 call/delegatecall 不与转账形态混淆；
+    # 不同金额/参数仍可区分，避免多个同形站点错配
+    from app.rules import _canonicalize_for_site
+
+    send_literal = _canonicalize_for_site("t.send(1);")[0]
+    send_var = _canonicalize_for_site("t.send(v);")[0]
+    call_empty = _canonicalize_for_site('t.call("");')[0]
+    delegate = _canonicalize_for_site('t.delegatecall("");')[0]
+
+    assert send_literal != send_var          # 金额表达式参与身份
+    assert call_empty != send_literal        # 非转账 call 不等于 send
+    assert delegate != call_empty            # delegatecall 保持独立
+    assert "valuetransfer" in send_var
+    assert "lowlevelcall" in call_empty
+    assert "lowleveldelegate" in delegate
+    print("[rules] 非转账/不同参数形态保持可区分")

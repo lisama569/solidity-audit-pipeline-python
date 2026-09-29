@@ -278,3 +278,162 @@ def test_diff_survives_restart(tmp_path):
         print(f"[difftask] 对比结论跨重启复用 hash={saved_hash[:16]}")
     finally:
         m2.shutdown()
+
+
+# --- 严重程度变化的真实提交 -> 审计 -> 对比链路 ---
+
+SEV_BASE = """
+contract Vault {
+    function withdraw(address payable to, uint amount) public {
+        to.send(amount);
+    }
+}
+"""
+SEV_CUR = """
+contract Vault {
+    function withdraw(address payable to, uint amount) public {
+        to.call{value: amount}("");
+    }
+}
+"""
+# 严重程度降低的反向演进（带 value 的低层 call 未检查 -> send 未检查）
+SEV_DOWN_CUR = """
+contract Vault {
+    function withdraw(address payable r, uint v) public {
+        r.send(v);
+    }
+}
+"""
+SEV_DOWN_BASE = """
+contract Vault {
+    function withdraw(address payable r, uint v) public {
+        r.call{value: v}("");
+    }
+}
+"""
+# 顶部插入无关合约、纯重命名、函数重排后的严重程度变化
+SEV_MOVED_CUR = """
+contract Helpers { function noop() public pure returns (uint) { return 1; } }
+
+contract Wallet {
+    mapping(address => uint) credit;
+    function pay2(address payable who, uint sum) public {
+        who.call{value: sum}("");
+    }
+    function drip(address x) public { x.send(9); }
+}
+"""
+SEV_MOVED_BASE = """
+contract Vault {
+    mapping(address => uint) balances;
+    function drip2(address y) public { y.send(9); }
+    function withdraw(address payable to, uint amount) public {
+        to.send(amount);
+    }
+}
+"""
+
+
+def _sev_diff(mgr, base_src, cur_src, name="Vault.sol"):
+    b = _baseline(mgr, base_src, name)
+    d = mgr.submit_diff(_f(cur_src, name), b.task_id)
+    done = mgr.wait_for(d.task_id, deadline=10.0)
+    return b, done
+
+
+def test_severity_change_end_to_end(mgr):
+    b, done = _sev_diff(mgr, SEV_BASE, SEV_CUR)
+    assert done.status is TaskStatus.SUCCEEDED
+    diff = done.diff
+    assert diff.counts["SEVERITY_CHANGED"] == 1
+    assert diff.counts["NEW"] == 0
+    assert diff.counts["FIXED"] == 0
+    assert diff.counts["PERSISTING"] == 0
+    e = diff.entries[0]
+    assert e.category.value == "SEVERITY_CHANGED"
+    assert e.baseline_severity.name == "LOW"
+    assert e.current_severity.name == "MEDIUM"
+    assert e.baseline_finding.function == "withdraw"
+    assert e.current_finding.function == "withdraw"
+    assert diff.baseline_fingerprint == b.fingerprint
+    print(f"[difftask] 真实链路严重程度升高 -> {diff.counts} "
+          f"{e.baseline_severity.name}->{e.current_severity.name}")
+
+
+def test_severity_decrease_end_to_end(mgr):
+    b, done = _sev_diff(mgr, SEV_DOWN_BASE, SEV_DOWN_CUR)
+    assert done.status is TaskStatus.SUCCEEDED
+    diff = done.diff
+    assert diff.counts["SEVERITY_CHANGED"] == 1
+    e = [e for e in diff.entries if e.category.value == "SEVERITY_CHANGED"][0]
+    assert e.baseline_severity.name == "MEDIUM"
+    assert e.current_severity.name == "LOW"
+    print("[difftask] 真实链路严重程度降低 MEDIUM->LOW")
+
+
+def test_severity_change_moved_and_renamed_end_to_end(mgr):
+    b, done = _sev_diff(mgr, SEV_MOVED_BASE, SEV_MOVED_CUR)
+    assert done.status is TaskStatus.SUCCEEDED
+    diff = done.diff
+    assert diff.counts["SEVERITY_CHANGED"] == 1
+    assert diff.counts["PERSISTING"] == 1
+    assert diff.counts["NEW"] == 0 and diff.counts["FIXED"] == 0
+    changed = [e for e in diff.entries
+               if e.category.value == "SEVERITY_CHANGED"][0]
+    assert changed.baseline_severity.name == "LOW"
+    assert changed.current_severity.name == "MEDIUM"
+    print("[difftask] 整体挪动+纯重命名+重排后真实链路仍判严重程度变化")
+
+
+def test_severity_change_concurrent_and_restart_consistent(tmp_path):
+    import threading
+
+    db = str(tmp_path / "sev.db")
+    m1 = TaskManager(TaskStore(db), timeout_seconds=30.0, auto_recover=False)
+    b = m1.wait_for(m1.submit(_f(SEV_BASE)).task_id, deadline=10.0)
+    assert b.status is TaskStatus.SUCCEEDED
+
+    barrier = threading.Barrier(16)
+    results = []
+
+    def submit():
+        barrier.wait()
+        results.append(m1.submit_diff(_f(SEV_CUR), b.task_id))
+
+    threads = [threading.Thread(target=submit) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    ids = {r.task_id for r in results}
+    assert len(ids) == 1
+    done = m1.wait_for(ids.pop(), deadline=10.0)
+    assert done.status is TaskStatus.SUCCEEDED
+    saved = done.diff
+    assert saved.counts["SEVERITY_CHANGED"] == 1
+    snapshot = [
+        (e.category.value, e.signature,
+         e.baseline_severity.name if e.baseline_severity else None,
+         e.current_severity.name if e.current_severity else None)
+        for e in saved.entries
+    ]
+    m1.shutdown()
+
+    # 重启后再查：任务复用，分类/条数/顺序/哈希全部一致
+    m2 = TaskManager(TaskStore(db), timeout_seconds=30.0, auto_recover=True)
+    try:
+        again = m2.submit_diff(_f(SEV_CUR), b.task_id)
+        assert again.task_id == done.task_id
+        assert again.status is TaskStatus.SUCCEEDED
+        assert again.diff.diff_hash == saved.diff_hash
+        assert dict(again.diff.counts) == dict(saved.counts)
+        again_snapshot = [
+            (e.category.value, e.signature,
+             e.baseline_severity.name if e.baseline_severity else None,
+             e.current_severity.name if e.current_severity else None)
+            for e in again.diff.entries
+        ]
+        assert again_snapshot == snapshot
+    finally:
+        m2.shutdown()
+    print(f"[difftask] 严重程度变化并发/重启一致 hash={saved.diff_hash[:16]}")

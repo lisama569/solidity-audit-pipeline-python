@@ -8,9 +8,15 @@
 
 同一处问题被多条规则命中时，由 engine 层按 (file, line, function) 合并。
 
-另提供 compute_site_signatures：为每个外部调用站点生成**跨版本稳定签名**，
-签名只依赖规范化后的函数体语义与调用点在函数内的序号，与行号、函数排列顺序、
-整体位移、标识符命名和注释无关，供版本对比做问题匹配。
+另提供 compute_site_signatures：为每个外部调用站点生成**跨版本身份信息**
+（合约分组键、结构槽位键、外部调用形态规范化后的函数体、稳定展示签名），
+与行号、函数排列顺序、整体位移、标识符命名和注释无关，供版本对比分两阶段
+（原位配对 + 最小位移兜底）做问题匹配。
+
+站点身份刻意不包含外部调用操作符（send/call/delegatecall/...）：操作符是
+严重程度的判定因素，同一站点 send->call（低危升中危）或 call->send（中危
+降低危）属于严重程度变化，若让操作符参与站点身份，这类演进会被误拆成
+「新增 + 已修复」。
 """
 from __future__ import annotations
 
@@ -61,6 +67,32 @@ class _Function:
     header: str
     body: str
     body_offset: int  # 相对文件开头的偏移
+
+
+@dataclass(frozen=True)
+class SiteInfo:
+    """单个外部调用站点的跨版本身份信息（供版本对比分两阶段匹配）。
+
+    - group_key：所属合约分组（文件 + 合约骨架），不含合约序号，
+      因此在文件内前置插入/重排合约不受影响；同文件内多个同骨架合约
+      （罕见）由 diffing 层按序号对齐消歧；
+    - ordinal_key：严格结构键（合约分组 + 函数序号 + 调用序号），
+      不含函数体语义，对整体挪动不敏感（函数体改动不改变序号）；
+    - body_canon：外部调用形态已规范化的函数体文本，对纯重命名、注释、
+      空白、调用操作符差异（send/transfer 与 call{value:…} 同属转账
+      形态）不敏感；非转账低层调用的 calldata 与转账金额表达式仍按
+      普通表达式参与规范化，用于区分不同站点；
+    - has_finding 不在这里：站点信息对所有外部调用站点（含已修复、不再
+      产出结论的站点）都生成，是否仍有结论由 diffing 层对照判断；
+    - stable_sig：站点稳定签名（结构 + 语义组合哈希，供展示与未配对条目）。
+    """
+
+    group_key: str
+    ordinal_key: str
+    function_ordinal: int   # 合约内函数序号（仅用于最近位移配对，不含进签名）
+    call_ordinal: int       # 函数内外调用点序号
+    body_canon: str
+    stable_sig: str
 
 
 @dataclass
@@ -360,6 +392,111 @@ _BUILTIN_IDS = frozenset(
 )
 _BUILTIN_TYPE_RE = re.compile(r"^(u?int\d*|bytes\d*|u?fixed\d*x\d+|addresspayable)$")
 
+# 外部调用操作符：是严重程度的判定因素，但不属于站点身份。
+# 站点签名规范化时，把「转账语义」的调用形态统一成同一形状：
+#   .send(x) / .transfer(x)                -> .valuetransfer(x)
+#   .call{value: x, ...}(...)              -> .valuetransfer(x)
+# 这样同一站点 send(amount) -> call{value: amount}("")（低危升中危）的
+# 签名保持不变，由 diffing 层识别为严重程度变化；而不带 value 的
+# call("")/delegatecall("") 是另一种形状，不会被错误等同。转账金额
+# 表达式（send 的参数或 call 的 value 选项）按常规表达式一起槽位化/字面
+# 归一，因此 send(2) 与 send(amount) 仍是不同站点，加上结构槽位约束，
+# 多个同形站点之间不会错配；非转账低层调用保留其 calldata 参数。
+_EXT_CALL_HEAD_RE = re.compile(
+    r"\.\s*(call|delegatecall|callcode|send|transfer)\b"
+)
+_VALUE_TRANSFER_TOKEN = "valuetransfer"
+
+
+def _skip_group(text: str, open_idx: int, open_ch: str, close_ch: str) -> int:
+    """返回与 text[open_idx] 的括号配对的右括号下标（处理嵌套）。"""
+    depth = 0
+    i = open_idx
+    while i < len(text):
+        c = text[i]
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return len(text) - 1
+
+
+def _neutralize_ext_calls(body: str) -> str:
+    """把函数体中的外部调用形态规范化（转账语义统一，其余仅去操作符差异）。
+
+    - send/transfer：操作符替换为统一转账标记，参数表保留；
+    - call/delegatecall/callcode 带 value 选项：连同选项与后续参数表一起
+      归一为「转账标记(value 表达式)」；
+    - 不带 value 的 call/delegatecall/callcode：操作符统一为通用低层调用
+      标记，参数表保留（不与转账形态混淆）。
+    """
+    out: list[str] = []
+    pos = 0
+    for m in _EXT_CALL_HEAD_RE.finditer(body, pos):
+        op = m.group(1)
+        dot_idx = body.index(".", m.start())
+        j = m.end()
+        while j < len(body) and body[j].isspace():
+            j += 1
+
+        if op in ("send", "transfer"):
+            out.append(body[pos:dot_idx])
+            out.append("." + _VALUE_TRANSFER_TOKEN)
+            pos = m.end(1)  # 保留参数表
+            continue
+
+        # call / delegatecall / callcode：检查 value 选项
+        opts_text = None
+        if j < len(body) and body[j] == "{":
+            close = _skip_group(body, j, "{", "}")
+            opts_text = body[j + 1:close]
+            j = close + 1
+            while j < len(body) and body[j].isspace():
+                j += 1
+
+        value_expr = None
+        if opts_text is not None:
+            vm = re.search(r"\bvalue\s*:\s*([^{}]+?)\s*(?:,|$)", opts_text)
+            if vm:
+                value_expr = vm.group(1).strip()
+
+        # 旧式 .call.value(x)(...)（规则引擎本身不识别旧式调用，这里仅在
+        # 站点签名侧做防御性归一）
+        if value_expr is None:
+            vm = re.match(r"\.\s*value\s*\(([^()]*)\)", body[j:])
+            if vm:
+                value_expr = vm.group(1).strip()
+                j += vm.end()
+                while j < len(body) and body[j].isspace():
+                    j += 1
+
+        if value_expr is not None and j < len(body) and body[j] == "(":
+            close = _skip_group(body, j, "(", ")")
+            out.append(body[pos:dot_idx])
+            out.append("." + _VALUE_TRANSFER_TOKEN + "(" + value_expr + ")")
+            pos = close + 1
+        else:
+            token = "lowlevelcall" if op == "call" else "lowleveldelegate"
+            out.append(body[pos:m.start(1)])
+            out.append(token)
+            pos = m.end(1)
+
+    out.append(body[pos:])
+    return "".join(out)
+
+
+def _canonicalize_for_site(code: str) -> tuple[str, dict[str, str]]:
+    """站点签名专用规范化：先中和外部调用形态，再做标识符槽位化。
+
+    与 _canonicalize 的区别是转账/低层调用操作符形态无关；纯重命名、
+    注释/空白差异同样不影响结果。
+    """
+    neutralized = _neutralize_ext_calls(code)
+    return _canonicalize(neutralized)
+
 _TOKEN_RE = re.compile(
     r"""
       (?P<hex>0x[0-9a-fA-F]+)
@@ -429,41 +566,75 @@ def _state_skeleton_canonical(contract: _Contract) -> str:
     return "|".join(parts)
 
 
-def _site_signature(
+def _site_info(
     file: str,
     contract: _Contract,
+    group_instance: int,
     fn: _Function,
+    function_ordinal: int,
     call_ordinal: int,
-) -> str:
-    body_canon, _ = _canonicalize(fn.body)
+) -> SiteInfo:
+    body_canon, _ = _canonicalize_for_site(fn.body)
     skeleton_canon = _state_skeleton_canonical(contract)
+
+    gh = hashlib.sha256()
+    # group_instance 仅用于区分同一文件内多个同骨架合约；前置插入的是
+    # 不同骨架合约时，同骨架合约的出现次序保持不变（位移不受影响）。
+    for part in (file, skeleton_canon, str(group_instance)):
+        gh.update(part.encode("utf-8"))
+        gh.update(b"\x00")
+    group_key = "G-" + gh.hexdigest()[:14]
+
+    oh = hashlib.sha256()
+    for part in (group_key, str(function_ordinal), str(call_ordinal)):
+        oh.update(part.encode("utf-8"))
+        oh.update(b"\x00")
+    ordinal_key = "O-" + oh.hexdigest()[:14]
+
     h = hashlib.sha256()
-    for part in (file, skeleton_canon, body_canon, str(call_ordinal)):
+    for part in (group_key, body_canon, str(call_ordinal)):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
-    return "S-" + h.hexdigest()[:14]
+    stable_sig = "S-" + h.hexdigest()[:14]
+
+    return SiteInfo(
+        group_key=group_key,
+        ordinal_key=ordinal_key,
+        function_ordinal=function_ordinal,
+        call_ordinal=call_ordinal,
+        body_canon=body_canon,
+        stable_sig=stable_sig,
+    )
 
 
 def compute_site_signatures(
     sources: dict[str, str], ordered_paths: list[str]
-) -> dict[tuple[str, str, str, int], str]:
-    """为每个外部调用站点计算跨版本稳定签名。
+) -> dict[tuple[str, str, str, int], SiteInfo]:
+    """为每个外部调用站点计算跨版本身份信息。
 
-    返回 {(file, contract, function, line): 站点基础签名}。
-    行号只作为字典键使用；签名内容本身不含行号，整体挪动/重排不受影响。
+    返回 {(file, contract, function, line): SiteInfo}。
+    行号只作为字典键使用；内容本身不含行号，整体挪动/重排不受影响。
     """
-    mapping: dict[tuple[str, str, str, int], str] = {}
+    mapping: dict[tuple[str, str, str, int], SiteInfo] = {}
     for path in ordered_paths:
         text = _strip_comments(sources[path])
+        seen_skeletons: dict[str, int] = {}
         for contract in _parse_contracts(text):
-            for fn in contract.functions:
+            skeleton_canon = _state_skeleton_canonical(contract)
+            group_instance = seen_skeletons.get(skeleton_canon, 0)
+            seen_skeletons[skeleton_canon] = group_instance + 1
+            # 函数序号在合约内**全部**函数（含无外部调用的函数）上计数：
+            # 这样序号相同才真正意味着"同一结构位置"，纯插入无调用函数
+            # 导致的位移也能被阶段 2 的最小位移匹配正确追踪。
+            for function_ordinal, fn in enumerate(contract.functions):
                 if fn.kind != "function":
                     continue
-                for ordinal, cm in enumerate(
+                for call_ordinal, cm in enumerate(
                     _EXT_CALL_RE.finditer(fn.body), start=1
                 ):
                     line = _line_of(text, fn.body_offset + cm.start())
-                    mapping[(path, contract.name, fn.name, line)] = (
-                        _site_signature(path, contract, fn, ordinal)
+                    mapping[(path, contract.name, fn.name, line)] = _site_info(
+                        path, contract, group_instance,
+                        fn, function_ordinal, call_ordinal,
                     )
     return mapping

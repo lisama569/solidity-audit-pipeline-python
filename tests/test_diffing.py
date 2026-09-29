@@ -74,8 +74,15 @@ def test_new_fixed_persisting_classification():
 
 
 def test_severity_change_via_constructed_findings():
-    # 同签名、同规则集、严重程度不同 -> SEVERITY_CHANGED
-    site = {("a.sol", "C", "f", 10): "S-site"}
+    # 同站点身份、同规则集、严重程度不同 -> SEVERITY_CHANGED
+    from app.rules import SiteInfo
+
+    info = SiteInfo(
+        group_key="G-site", ordinal_key="O-site",
+        function_ordinal=0, call_ordinal=1,
+        body_canon="B-site", stable_sig="S-site",
+    )
+    site = {("a.sol", "C", "f", 10): info}
     f = lambda sev: Finding(
         "F-x", ("RULE_X",), sev, "a.sol", 10, "C", "f", "msg"
     )
