@@ -10,7 +10,10 @@
 
 另提供 compute_site_signatures：为每个外部调用站点生成**跨版本稳定签名**，
 签名只依赖规范化后的函数体语义与调用点在函数内的序号，与行号、函数排列顺序、
-整体位移、标识符命名和注释无关，供版本对比做问题匹配。
+整体位移、标识符命名和注释无关；并且会把外部调用原语（call/delegatecall/
+send/transfer/...）连同其 {value:...} 选项块与参数列表统一抹成占位符——
+原语与参数只决定调用的**严重程度**，抹掉后"同一处调用仅严重程度变化"在版本
+对比里仍能配上，供版本对比做问题匹配。
 """
 from __future__ import annotations
 
@@ -429,13 +432,82 @@ def _state_skeleton_canonical(contract: _Contract) -> str:
     return "|".join(parts)
 
 
+def _skip_balanced(text: str, open_idx: int) -> int:
+    """跳过 text[open_idx] 处的成对括号（() 或 {}），返回右括号之后的下标。
+
+    扫描时跳过字符串字面量，避免字符串里的括号干扰配对。
+    """
+    open_ch, close_ch = text[open_idx], None
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    close_ch = pairs.get(open_ch)
+    if close_ch is None:
+        return open_idx + 1
+    depth = 0
+    i = open_idx
+    in_str: str | None = None
+    while i < len(text):
+        c = text[i]
+        if in_str is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+        elif c in ("'", '"'):
+            in_str = c
+        elif c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(text)
+
+
+def _mask_external_calls(body: str) -> str:
+    """把函数体里每个外部调用表达式整体替换为统一占位符 ``#``。
+
+    被抹掉的是「调用原语（call/delegatecall/send/transfer/...）+ 可选
+    {value:...} 选项块 + 参数列表」——这正是决定调用**严重程度**的部分；
+    调用目标链（``msg.sender``/``t`` 等）、调用前后语句与结构全部保留。
+
+    这样同一处调用仅由 send 改成 call（低危->中危）这类**只改变严重程度**
+    的演进不会改变站点签名；而删除调用、在别处新增调用、改动周边语句等
+    实质变化仍会改变签名。
+    """
+    spans: list[tuple[int, int]] = []
+    for m in _EXT_CALL_RE.finditer(body):
+        end = m.end()
+        # _EXT_CALL_RE 以 '(' 或 '{' 结尾：先跳选项块（若有），再跳参数表
+        if end - 1 < len(body) and body[end - 1] == "{":
+            end = _skip_balanced(body, end - 1)
+            if end < len(body) and body[end] == "(":
+                end = _skip_balanced(body, end)
+        else:
+            end = _skip_balanced(body, end - 1)
+        spans.append((m.start(), end))
+    if not spans:
+        return body
+    out: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        out.append(body[cursor:start])
+        out.append("#")
+        cursor = end
+    out.append(body[cursor:])
+    return "".join(out)
+
+
 def _site_signature(
     file: str,
     contract: _Contract,
     fn: _Function,
     call_ordinal: int,
 ) -> str:
-    body_canon, _ = _canonicalize(fn.body)
+    # 站点签名只描述"问题的位置与周边实质"，不描述调用原语本身：
+    # 原语（send/call/...）与参数只影响严重程度，抹掉后严重程度升降仍能配对。
+    body_canon, _ = _canonicalize(_mask_external_calls(fn.body))
     skeleton_canon = _state_skeleton_canonical(contract)
     h = hashlib.sha256()
     for part in (file, skeleton_canon, body_canon, str(call_ordinal)):
@@ -450,7 +522,8 @@ def compute_site_signatures(
     """为每个外部调用站点计算跨版本稳定签名。
 
     返回 {(file, contract, function, line): 站点基础签名}。
-    行号只作为字典键使用；签名内容本身不含行号，整体挪动/重排不受影响。
+    行号只作为字典键使用；签名内容本身不含行号，整体挪动/重排不受影响；
+    调用原语与参数在规范化前被统一抹掉，仅原语（即严重程度）变化不改变签名。
     """
     mapping: dict[tuple[str, str, str, int], str] = {}
     for path in ordered_paths:

@@ -2,9 +2,12 @@
 
 可复现性保证：
 - 匹配签名只依赖问题实质（站点稳定签名 + 命中规则集合），与行号、函数/合约
-  顺序、整体位移、标识符命名、注释无关；
-- 同签名按多重集确定性配对（按严重程度/位置稳定键排序后逐对配对），
-  配对与分类只依赖两份报告内容本身；
+  顺序、整体位移、标识符命名、注释无关；站点签名在规则层把外部调用原语
+  （send/call/...）及其选项/参数统一抹掉，因此"同一处调用仅原语改变
+  （严重程度随之升降）"仍是同一站点，会被识别为 SEVERITY_CHANGED；
+- 同签名组内先按严重程度桶配 PERSISTING，两侧剩余**数量相等**时才逐对
+  判为 SEVERITY_CHANGED；数量失衡（旧问题删除、旁边又冒出同形新问题）时
+  保守记为 FIXED/NEW，绝不硬并；
 - 结论按 (分类, 签名) 稳定排序并整体计算 diff_hash，
   重复/并发/乱序提交、先跑哪一边，结论都完全一致。
 """
@@ -18,6 +21,7 @@ from app.models import (
     DiffEntry,
     DiffReport,
     Finding,
+    Severity,
 )
 
 # (file, contract, function, line) -> 站点稳定签名
@@ -80,6 +84,16 @@ def _index_by_signature(
     return groups
 
 
+def _group_by_severity(findings: list[Finding]) -> dict[Severity, list[Finding]]:
+    """把同签名组内的结论按严重程度分桶，桶内保持稳定排序。"""
+    buckets: dict[Severity, list[Finding]] = {}
+    for f in findings:
+        buckets.setdefault(f.severity, []).append(f)
+    for bucket in buckets.values():
+        bucket.sort(key=_finding_sort_key)
+    return buckets
+
+
 def compare_reports(
     current: AuditReport,
     baseline: AuditReport,
@@ -96,50 +110,77 @@ def compare_reports(
     for sig in all_sigs:
         cur_list = cur_groups.get(sig, [])
         base_list = base_groups.get(sig, [])
-        paired = min(len(cur_list), len(base_list))
-        for i in range(paired):
-            b, c = base_list[i], cur_list[i]
-            if c.severity is b.severity:
-                category = DiffCategory.PERSISTING
-            else:
-                category = DiffCategory.SEVERITY_CHANGED
-            entries.append(
-                DiffEntry(
-                    category=category,
-                    signature=sig,
-                    rule_ids=c.rule_ids,
-                    baseline_finding=b,
-                    current_finding=c,
-                    baseline_severity=b.severity,
-                    current_severity=c.severity,
+
+        # 同签名组内配对分两步：
+        # 1) 严重程度相同的先配成 PERSISTING（多重集按稳定键逐对）；
+        # 2) 两侧剩余项数量相等时才逐对配成 SEVERITY_CHANGED；数量不等说明该
+        #    签名组发生了删除/新增（如旧问题删掉、旁边又冒出一个同形新问题），
+        #    此时保守地记为 FIXED/NEW，绝不硬并成严重程度变化。
+        cur_by_sev = _group_by_severity(cur_list)
+        base_by_sev = _group_by_severity(base_list)
+        leftover_cur: list[Finding] = []
+        leftover_base: list[Finding] = []
+        for sev in sorted(set(cur_by_sev) | set(base_by_sev)):
+            cs = cur_by_sev.get(sev, [])
+            bs = base_by_sev.get(sev, [])
+            same = min(len(cs), len(bs))
+            for i in range(same):
+                b, c = bs[i], cs[i]
+                entries.append(
+                    DiffEntry(
+                        category=DiffCategory.PERSISTING,
+                        signature=sig,
+                        rule_ids=c.rule_ids,
+                        baseline_finding=b,
+                        current_finding=c,
+                        baseline_severity=b.severity,
+                        current_severity=c.severity,
+                    )
                 )
-            )
-        # 同签名多重集多出的基线侧 -> 已修复
-        for b in base_list[paired:]:
-            entries.append(
-                DiffEntry(
-                    category=DiffCategory.FIXED,
-                    signature=sig,
-                    rule_ids=b.rule_ids,
-                    baseline_finding=b,
-                    current_finding=None,
-                    baseline_severity=b.severity,
-                    current_severity=None,
+            leftover_base.extend(bs[same:])
+            leftover_cur.extend(cs[same:])
+
+        leftover_cur.sort(key=_finding_sort_key)
+        leftover_base.sort(key=_finding_sort_key)
+        if len(leftover_cur) == len(leftover_base):
+            for b, c in zip(leftover_base, leftover_cur):
+                entries.append(
+                    DiffEntry(
+                        category=DiffCategory.SEVERITY_CHANGED,
+                        signature=sig,
+                        rule_ids=c.rule_ids,
+                        baseline_finding=b,
+                        current_finding=c,
+                        baseline_severity=b.severity,
+                        current_severity=c.severity,
+                    )
                 )
-            )
-        # 同签名多重集多出的新版本侧 -> 新增
-        for c in cur_list[paired:]:
-            entries.append(
-                DiffEntry(
-                    category=DiffCategory.NEW,
-                    signature=sig,
-                    rule_ids=c.rule_ids,
-                    baseline_finding=None,
-                    current_finding=c,
-                    baseline_severity=None,
-                    current_severity=c.severity,
+        else:
+            # 数量失衡：两侧剩余都不强行配对，保守按删除/新增处理
+            for b in leftover_base:
+                entries.append(
+                    DiffEntry(
+                        category=DiffCategory.FIXED,
+                        signature=sig,
+                        rule_ids=b.rule_ids,
+                        baseline_finding=b,
+                        current_finding=None,
+                        baseline_severity=b.severity,
+                        current_severity=None,
+                    )
                 )
-            )
+            for c in leftover_cur:
+                entries.append(
+                    DiffEntry(
+                        category=DiffCategory.NEW,
+                        signature=sig,
+                        rule_ids=c.rule_ids,
+                        baseline_finding=None,
+                        current_finding=c,
+                        baseline_severity=None,
+                        current_severity=c.severity,
+                    )
+                )
 
     category_rank = {cat: i for i, cat in enumerate(_CATEGORY_ORDER)}
 

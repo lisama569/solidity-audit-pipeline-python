@@ -150,3 +150,38 @@ contract Wallet {
     assert r2b["diff"]["baseline_task_id"] == b2
     assert r1["diff"]["diff_hash"] != r2b["diff"]["diff_hash"]
     print("[api-diff] 不同基线独立结论，互不复用")
+
+
+SEV_BASE = """
+contract Vault {
+    function leak() public { msg.sender.send(1); }
+}
+"""
+SEV_CUR = """
+contract Vault {
+    function leak() public { msg.sender.call(""); }
+}
+"""
+
+
+def test_api_compare_severity_change(client):
+    base_id = _baseline_simple(client, SEV_BASE)
+    r = _upload(client, f"/audits/{base_id}/compare", [("Vault.sol", SEV_CUR)])
+    assert r.status_code == 202, r.text
+    body = _wait(client, r.json()["task_id"])
+    diff = body["diff"]
+    assert diff["counts"]["SEVERITY_CHANGED"] == 1
+    assert diff["counts"]["NEW"] == 0 and diff["counts"]["FIXED"] == 0
+    e = diff["entries"][0]
+    assert e["category"] == "SEVERITY_CHANGED"
+    assert e["baseline_severity"] == "LOW"
+    assert e["current_severity"] == "MEDIUM"
+    assert e["baseline_finding"]["severity"] == "LOW"
+    assert e["current_finding"]["severity"] == "MEDIUM"
+    print(f"[api-diff] 严重程度变化 LOW->MEDIUM -> {e['category']}")
+
+
+def _baseline_simple(client, src):
+    r = _upload(client, "/audits", [("Vault.sol", src)])
+    assert r.status_code == 202
+    return _wait(client, r.json()["task_id"])["task_id"]
